@@ -100,10 +100,8 @@ def test_rate_limit_slot_held_for_streaming_response(router_manager, mock_worker
     forwards the SSE body from a spawned task, so a slot released at that point
     bounds time-to-first-token instead of the number of concurrent generations.
 
-    Timing: the token bucket refills at `rate_limit_tokens_per_second`, so with a
-    capacity of one the second request has to be sent within a second of the first
-    to prove anything. The worker streams for ~6s, leaving plenty of room on the
-    other side.
+    Wait beyond the rate bucket's one-second refill interval. The concurrency
+    slot must stay occupied while the worker streams for approximately six seconds.
     """
     _, urls, _ = mock_workers(n=1, args=["--stream", "--latency-ms", "3000"])
     rh = router_manager.start_router(
@@ -135,7 +133,7 @@ def test_rate_limit_slot_held_for_streaming_response(router_manager, mock_worker
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
         streaming = ex.submit(post, "long", True)
-        time.sleep(0.4)  # first chunk is still 2.6s away; refill is 1s away
+        time.sleep(1.4)  # The rate bucket has refilled, but the stream is still active.
         second = ex.submit(post, "short", False).result()
 
     assert streaming.result() == 200
