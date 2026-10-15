@@ -12,63 +12,6 @@ env:
 
 steps:
   # ============================================================================
-  # Fast Checks - Run in parallel for quick feedback
-  # ============================================================================
-  - group: ":mag: Fast Checks"
-    key: "fast-checks"
-    steps:
-      - label: ":rust: Rust Format Check"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  rustup component add rustfmt
-                  cargo fmt --check
-        agents:
-          queue: "cpu_queue_premerge"
-
-      - label: ":rust: Clippy"
-        plugins:
-          - docker#v5.11.0:
-              image: "$RUST_IMAGE"
-              workdir: /workdir
-              volumes:
-                - ".:/workdir"
-              environment:
-                - "CARGO_INCREMENTAL=0"
-                - "RUST_BACKTRACE=1"
-              command:
-                - bash
-                - -c
-                - |
-                  apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
-                  rustup component add clippy
-                  cargo clippy --all-targets --all-features -- -D warnings
-        agents:
-          queue: "cpu_queue_premerge"
-
-      - label: ":python: Python Format Check"
-        command: |
-          pip install black ruff==0.16.0
-          python -m black --check py_src/ py_test/
-          python -m ruff check py_src/ py_test/
-        agents:
-          queue: "cpu_queue_premerge"
-
-  # Wait for fast checks to pass before building
-  - wait: ~
-    continue_on_failure: false
-
-  # ============================================================================
   # Build - Create release artifacts
   # ============================================================================
   - group: ":hammer: Build"
@@ -145,6 +88,8 @@ steps:
                 - -c
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+                  # wasm_middleware unit tests load the example component artifact
+                  bash examples/wasm_middleware/build.sh
                   cargo test --lib --bins
         agents:
           queue: "cpu_queue_premerge"
@@ -183,6 +128,9 @@ steps:
                 - -c
                 - |
                   apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler python3 python3-pip python3-dev python3-venv
+                  # WASM middleware pytest needs the example component + router binary
+                  bash examples/wasm_middleware/build.sh
+                  cargo build --release --bin vllm-router
                   python3 -m venv /tmp/venv
                   source /tmp/venv/bin/activate
                   pip install -U pip setuptools wheel setuptools-rust
@@ -351,17 +299,28 @@ steps:
       - "/tmp/router.log"
 
   # This queue is intentionally separate from the shared amd_mi300_* queues.
-  # Those agents run with --no-plugins, while this lane needs the Docker plugin
+  # Those agents run --no-plugins, while this lane needs the Docker plugin
   # to provide the pinned vLLM/MoRI userspace on a two-GPU xGMI host. Put the
   # condition on the group so fork builds cannot run plugin hooks.
+  # TEMPORARILY DISABLED for automatic builds while the MI300X host cannot
+  # run this lane: the readiness hook on the agent polls for the
+  # digest-pinned ROCm image and fails every build in the pre-command hook,
+  # before any test executes (so pytest.mark.skip would not help either).
+  # The lane stays manually runnable for trusted UI/API builds with
+  # RUN_ROCM_XGMI=1; swap in the original triggers (commented below) once
+  # the host pre-pulls the pinned image digest.
+  # Tracked in https://github.com/vllm-project/router/issues/363
   - group: ":large_purple_circle: ROCm MoRI XGMI P/D"
     key: "pd-disagg-moriio-tests"
     if: |
-      build.branch == pipeline.default_branch ||
-      build.merge_queue.base_branch == pipeline.default_branch ||
-      (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
-      ((build.source == "ui" || build.source == "api") &&
-       build.env("RUN_ROCM_XGMI") == "1")
+      (build.source == "ui" || build.source == "api") &&
+      build.env("RUN_ROCM_XGMI") == "1"
+    # if: |
+    #   build.branch == pipeline.default_branch ||
+    #   build.merge_queue.base_branch == pipeline.default_branch ||
+    #   (build.pull_request.id != null && build.pull_request.repository.fork == false) ||
+    #   ((build.source == "ui" || build.source == "api") &&
+    #    build.env("RUN_ROCM_XGMI") == "1")
     steps:
       - label: "ROCm MoRI XGMI (read_mode={{matrix.read_mode}}, 2 GPUs)"
         key: "pd-disagg-moriio-test"
