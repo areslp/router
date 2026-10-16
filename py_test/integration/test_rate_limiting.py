@@ -138,3 +138,45 @@ def test_rate_limit_slot_held_for_streaming_response(router_manager, mock_worker
 
     assert streaming.result() == 200
     assert second == 429, f"slot was released mid-stream, got {second}"
+
+
+@pytest.mark.integration
+def test_rate_limit_429_carries_retry_after(router_manager, mock_workers):
+    """A throttled request must come back with a Retry-After hint.
+
+    OpenAI-compatible SDKs treat a 429 without the header as non-retryable and
+    surface it to the caller instead of backing off, which turns a transient
+    queue-full into a hard failure.
+    """
+    _, urls, _ = mock_workers(n=1, args=["--latency-ms", "100"])
+    rh = router_manager.start_router(
+        worker_urls=urls,
+        policy="round_robin",
+        extra={
+            "max_concurrent_requests": 1,
+            "queue_size": 0,  # no queue -> immediate 429 when the slot is taken
+        },
+    )
+
+    def call_once(i):
+        try:
+            r = requests.post(
+                f"{rh.url}/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": f"r{i}",
+                    "max_tokens": 1,
+                    "stream": False,
+                },
+                timeout=3,
+            )
+            return r.status_code, r.headers.get("Retry-After")
+        except Exception:
+            return 599, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(call_once, range(8)))
+
+    throttled = [retry_after for code, retry_after in results if code == 429]
+    assert throttled, f"no request was throttled: {results}"
+    assert all(v is not None and int(v) >= 1 for v in throttled), results

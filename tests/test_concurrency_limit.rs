@@ -30,6 +30,20 @@ async fn app(
     mpsc::UnboundedReceiver<mpsc::Sender<Chunk>>,
     Arc<Notify>,
 ) {
+    let (app, started, entered, _) = app_with_queue_processor(queue_size, rate, true).await;
+    (app, started, entered)
+}
+
+async fn app_with_queue_processor(
+    queue_size: usize,
+    rate: usize,
+    start_processor: bool,
+) -> (
+    Router,
+    mpsc::UnboundedReceiver<mpsc::Sender<Chunk>>,
+    Arc<Notify>,
+    Option<vllm_router_rs::middleware::QueueProcessor>,
+) {
     let config = RouterConfig {
         max_concurrent_requests: 1,
         rate_limit_tokens_per_second: Some(rate),
@@ -48,9 +62,14 @@ async fn app(
         queue_size,
         Duration::from_secs(3),
     );
-    if let Some(processor) = processor {
-        tokio::spawn(processor.run());
-    }
+    let processor = if start_processor {
+        if let Some(processor) = processor {
+            tokio::spawn(processor.run());
+        }
+        None
+    } else {
+        processor
+    };
     let state = Arc::new(AppState {
         router,
         context,
@@ -88,7 +107,7 @@ async fn app(
             state,
             concurrency_limit_middleware,
         ));
-    (app, started_rx, entered)
+    (app, started_rx, entered, processor)
 }
 
 async fn request(app: Router, path: &str) -> Response {
@@ -103,10 +122,9 @@ async fn disabled_queue_rejects_after_rate_refill_until_stream_eof() {
     let first = request(app.clone(), "/stream").await;
     let tx = started.recv().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert_eq!(
-        request(app.clone(), "/short").await.status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    let rejected = request(app.clone(), "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
     drop(tx);
     first.into_body().collect().await.unwrap();
     assert_eq!(request(app, "/short").await.status(), StatusCode::OK);
@@ -313,4 +331,44 @@ async fn queued_request_times_out_while_stream_remains_active() {
             .status(),
         StatusCode::OK
     );
+}
+
+fn assert_retry_after(response: &Response) {
+    let seconds = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(seconds >= 1);
+}
+
+#[tokio::test]
+async fn full_queue_returns_retry_after_without_starting_request() {
+    let (app, mut started, _, _processor) = app_with_queue_processor(1, 100, false).await;
+    let first = request(app.clone(), "/stream").await;
+    let _tx = started.recv().await.unwrap();
+    let mut queued = tokio::spawn(request(app.clone(), "/short"));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut queued)
+        .await
+        .is_err());
+    let rejected = request(app, "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    drop(first);
+}
+
+#[tokio::test]
+async fn exhausted_rate_bucket_returns_retry_after() {
+    let (app, _, _) = app(0, 1).await;
+    request(app.clone(), "/short")
+        .await
+        .into_body()
+        .collect()
+        .await
+        .unwrap();
+    let rejected = request(app, "/short").await;
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after(&rejected);
 }
